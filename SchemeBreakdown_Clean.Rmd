@@ -1,0 +1,365 @@
+Scheme Breakdown
+```{r}
+library(dplyr)
+library(tidyr)
+library(xgboost)
+
+# ============================================================================
+# Get coverage info
+# ============================================================================
+
+coverage_by_play <- sumer_frame %>%
+  mutate(game_id = as.character(game_id)) %>%
+  select(game_id, play_id, coverage_scheme) %>%
+  distinct()
+
+player_assignments <- sumer_playerplay %>%
+  mutate(game_id = as.character(game_id)) %>%
+  select(game_id, play_id, nfl_id, coverage_responsibility) %>%
+  distinct()
+
+model_data_full$game_id <- as.character(model_data_full$game_id)
+speed_model_full$game_id <- as.character(speed_model_full$game_id)
+
+# ============================================================================
+# Build path data with predictions from current models
+# ============================================================================
+
+sequential_model_data_final$game_id <- as.character(sequential_model_data_final$game_id)
+
+# Get break frames for filtering
+break_frames <- modeling_data %>%
+  filter(!is.na(anticipation_frames)) %>%
+  mutate(game_id = as.character(game_id)) %>%
+  select(game_id, play_id, nfl_id, anticipation_frame = anticipation_frames) %>%
+  distinct()
+
+sequential_features_clean <- setdiff(sequential_features, "distance_to_qb_now")
+
+categorical_vars <- c("player_position", "coverage_responsibility", "alignment", 
+                      "dropback_type", "play_action")
+
+# Pass Defense predictions
+pass_def_path <- sequential_model_data_final %>%
+  inner_join(break_frames, by = c("game_id", "play_id", "nfl_id")) %>%
+  filter(frame_id >= anticipation_frame) %>%
+  select(game_id, play_id, nfl_id, frame_id,
+         made_pass_defense, made_tackle,
+         all_of(sequential_features_clean)) %>%
+  mutate(across(all_of(categorical_vars), as.factor))
+
+pass_def_xgb <- pass_def_path %>%
+  mutate(across(where(is.factor), ~as.numeric(as.factor(.))))
+
+X_pd <- pass_def_xgb %>% 
+  select(all_of(sequential_features_clean)) %>% 
+  as.matrix()
+
+d_pd <- xgb.DMatrix(data = X_pd)
+pass_def_path$pred_prob_pd <- predict(xgb_model_pd, d_pd)
+
+# Tackle predictions (on complete passes only for the model, but we keep all for path data)
+tackle_path <- sequential_model_data_final %>%
+  left_join(
+    tackle_data %>% 
+      mutate(game_id = as.character(old_game_id)) %>%
+      select(game_id, play_id, complete_pass),
+    by = c("game_id", "play_id")
+  ) %>%
+  filter(complete_pass == 1) %>%
+  inner_join(break_frames, by = c("game_id", "play_id", "nfl_id")) %>%
+  filter(frame_id >= anticipation_frame) %>%
+  select(game_id, play_id, nfl_id, frame_id,
+         made_tackle,
+         all_of(sequential_features_clean)) %>%
+  mutate(across(all_of(categorical_vars), as.factor))
+
+tackle_xgb <- tackle_path %>%
+  mutate(across(where(is.factor), ~as.numeric(as.factor(.))))
+
+X_tk <- tackle_xgb %>% 
+  select(all_of(sequential_features_clean)) %>% 
+  as.matrix()
+
+d_tk <- xgb.DMatrix(data = X_tk)
+tackle_path$pred_prob_tkl <- predict(xgb_model_tk, d_tk)
+
+# ============================================================================
+# Filter to Cover 2 and Cover 4 only
+# ============================================================================
+
+cover_2_4 <- c("COVER 2", "COVER 4")
+
+# ============================================================================
+# 1. OVERALL SCHEME COMPARISON (Cover 2 vs Cover 4)
+# ============================================================================
+
+# Break metrics
+overall_break <- model_data_full %>%
+  left_join(coverage_by_play, by = c("game_id", "play_id")) %>%
+  filter(coverage_scheme %in% cover_2_4) %>%
+  group_by(coverage_scheme) %>%
+  summarize(
+    n_plays = n(),
+    breaks = sum(breaks_on_ball, na.rm = TRUE),
+    break_rate = round(mean(breaks_on_ball, na.rm = TRUE) * 100, 1),
+    expected_break_rate = round(mean(pred_break_prob, na.rm = TRUE) * 100, 1),
+    break_rate_oe = round((mean(breaks_on_ball, na.rm = TRUE) - mean(pred_break_prob, na.rm = TRUE)) * 100, 1),
+    .groups = "drop"
+  )
+
+# Frames metrics
+overall_frames <- speed_model_full %>%
+  left_join(coverage_by_play, by = c("game_id", "play_id")) %>%
+  filter(coverage_scheme %in% cover_2_4) %>%
+  group_by(coverage_scheme) %>%
+  summarize(
+    n_breaks = n(),
+    avg_frames = round(mean(anticipation_speed, na.rm = TRUE), 2),
+    expected_frames = round(mean(pred_speed, na.rm = TRUE), 2),
+    frames_oe = round(mean(anticipation_speed - pred_speed, na.rm = TRUE), 2),
+    .groups = "drop"
+  )
+
+# Path metrics - Pass Defense
+overall_pd_path <- pass_def_path %>%
+  left_join(coverage_by_play, by = c("game_id", "play_id")) %>%
+  filter(coverage_scheme %in% cover_2_4) %>%
+  group_by(game_id, play_id, nfl_id, coverage_scheme, made_pass_defense) %>%
+  arrange(frame_id) %>%
+  summarize(
+    pd_gain = last(pred_prob_pd) - first(pred_prob_pd),
+    .groups = "drop"
+  ) %>%
+  group_by(coverage_scheme) %>%
+  summarize(
+    n_plays_path = n(),
+    pass_defenses = sum(made_pass_defense, na.rm = TRUE),
+    pd_prob_gain = round(mean(pd_gain, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  )
+
+# Path metrics - Tackle
+overall_tkl_path <- tackle_path %>%
+  left_join(coverage_by_play, by = c("game_id", "play_id")) %>%
+  filter(coverage_scheme %in% cover_2_4) %>%
+  group_by(game_id, play_id, nfl_id, coverage_scheme, made_tackle) %>%
+  arrange(frame_id) %>%
+  summarize(
+    tkl_gain = last(pred_prob_tkl) - first(pred_prob_tkl),
+    .groups = "drop"
+  ) %>%
+  group_by(coverage_scheme) %>%
+  summarize(
+    tackles = sum(made_tackle, na.rm = TRUE),
+    tkl_prob_gain = round(mean(tkl_gain, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  )
+
+# Combine
+overall_scheme <- overall_break %>%
+  left_join(overall_frames, by = "coverage_scheme") %>%
+  left_join(overall_pd_path, by = "coverage_scheme") %>%
+  left_join(overall_tkl_path, by = "coverage_scheme") %>%
+  arrange(desc(n_plays))
+
+cat("\n============================================================\n")
+cat("   COVER 2 vs COVER 4 OVERALL COMPARISON\n")
+cat("============================================================\n\n")
+print(as.data.frame(overall_scheme), row.names = FALSE)
+
+# ============================================================================
+# 2. ASSIGNMENT BREAKDOWN FOR COVER 2 AND COVER 4
+# ============================================================================
+
+# Break metrics by assignment and scheme
+assignment_break <- model_data_full %>%
+  left_join(coverage_by_play, by = c("game_id", "play_id")) %>%
+  left_join(player_assignments, by = c("game_id", "play_id", "nfl_id")) %>%
+  filter(coverage_scheme %in% cover_2_4, !is.na(coverage_responsibility.y)) %>%
+  group_by(coverage_scheme, coverage_responsibility.y) %>%
+  summarize(
+    n_plays = n(),
+    break_rate = round(mean(breaks_on_ball, na.rm = TRUE) * 100, 1),
+    break_rate_oe = round((mean(breaks_on_ball, na.rm = TRUE) - mean(pred_break_prob, na.rm = TRUE)) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  rename(coverage_responsibility = coverage_responsibility.y)
+
+# Frames metrics by assignment and scheme
+assignment_frames <- speed_model_full %>%
+  left_join(coverage_by_play, by = c("game_id", "play_id")) %>%
+  left_join(player_assignments, by = c("game_id", "play_id", "nfl_id")) %>%
+  filter(coverage_scheme %in% cover_2_4, !is.na(coverage_responsibility.y)) %>%
+  group_by(coverage_scheme, coverage_responsibility.y) %>%
+  summarize(
+    n_breaks = n(),
+    avg_frames = round(mean(anticipation_speed, na.rm = TRUE), 2),
+    frames_oe = round(mean(anticipation_speed - pred_speed, na.rm = TRUE), 2),
+    .groups = "drop"
+  ) %>%
+  rename(coverage_responsibility = coverage_responsibility.y)
+
+# Path metrics by assignment - Pass Defense
+assignment_pd_path <- pass_def_path %>%
+  left_join(coverage_by_play, by = c("game_id", "play_id")) %>%
+  left_join(player_assignments, by = c("game_id", "play_id", "nfl_id")) %>%
+  filter(coverage_scheme %in% cover_2_4, !is.na(coverage_responsibility.y)) %>%
+  group_by(game_id, play_id, nfl_id, coverage_scheme, coverage_responsibility.y, made_pass_defense) %>%
+  arrange(frame_id) %>%
+  summarize(
+    pd_gain = last(pred_prob_pd) - first(pred_prob_pd),
+    .groups = "drop"
+  ) %>%
+  group_by(coverage_scheme, coverage_responsibility.y) %>%
+  summarize(
+    n_plays_path = n(),
+    pd_prob_gain = round(mean(pd_gain, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  rename(coverage_responsibility = coverage_responsibility.y)
+
+# Path metrics by assignment - Tackle
+assignment_tkl_path <- tackle_path %>%
+  left_join(coverage_by_play, by = c("game_id", "play_id")) %>%
+  left_join(player_assignments, by = c("game_id", "play_id", "nfl_id")) %>%
+  filter(coverage_scheme %in% cover_2_4, !is.na(coverage_responsibility.y)) %>%
+  group_by(game_id, play_id, nfl_id, coverage_scheme, coverage_responsibility.y, made_tackle) %>%
+  arrange(frame_id) %>%
+  summarize(
+    tkl_gain = last(pred_prob_tkl) - first(pred_prob_tkl),
+    .groups = "drop"
+  ) %>%
+  group_by(coverage_scheme, coverage_responsibility.y) %>%
+  summarize(
+    tkl_prob_gain = round(mean(tkl_gain, na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  rename(coverage_responsibility = coverage_responsibility.y)
+
+# Combine all
+assignment_full <- assignment_break %>%
+  left_join(assignment_frames, by = c("coverage_scheme", "coverage_responsibility")) %>%
+  left_join(assignment_pd_path, by = c("coverage_scheme", "coverage_responsibility")) %>%
+  left_join(assignment_tkl_path, by = c("coverage_scheme", "coverage_responsibility")) %>%
+  filter(n_plays >= 20) %>%
+  arrange(coverage_responsibility, coverage_scheme)
+
+cat("\n============================================================\n")
+cat("   COVER 2 vs COVER 4 BY ASSIGNMENT\n")
+cat("============================================================\n\n")
+print(as.data.frame(assignment_full), row.names = FALSE)
+
+# ============================================================================
+# 3. DEEP ZONE COMPARISON (THIRD, HALF, QUARTER, POST)
+# ============================================================================
+
+deep_zones <- c("THIRD", "HALF", "QUARTER", "POST")
+
+deep_comparison <- assignment_full %>%
+  filter(coverage_responsibility %in% deep_zones) %>%
+  arrange(coverage_responsibility, coverage_scheme)
+
+cat("\n============================================================\n")
+cat("   DEEP ZONE COMPARISON - COVER 2 vs COVER 4\n")
+cat("   (THIRD, HALF, QUARTER, POST)\n")
+cat("============================================================\n\n")
+print(as.data.frame(deep_comparison), row.names = FALSE)
+
+# ============================================================================
+# 4. UNDERNEATH ZONE COMPARISON (FLAT, CURL FLAT, HOOK CURL, HOLE)
+# ============================================================================
+
+underneath_zones <- c("FLAT", "CURL FLAT", "HOOK CURL", "HOLE")
+
+underneath_comparison <- assignment_full %>%
+  filter(coverage_responsibility %in% underneath_zones) %>%
+  arrange(coverage_responsibility, coverage_scheme)
+
+cat("\n============================================================\n")
+cat("   UNDERNEATH ZONE COMPARISON - COVER 2 vs COVER 4\n")
+cat("   (FLAT, CURL FLAT, HOOK CURL, HOLE)\n")
+cat("============================================================\n\n")
+print(as.data.frame(underneath_comparison), row.names = FALSE)
+
+# ============================================================================
+# 5. MAN COVERAGE IN COVER 2 vs COVER 4
+# ============================================================================
+
+man_comparison <- assignment_full %>%
+  filter(coverage_responsibility == "MAN") %>%
+  arrange(desc(n_plays))
+
+cat("\n============================================================\n")
+cat("   MAN COVERAGE - COVER 2 vs COVER 4\n")
+cat("============================================================\n\n")
+print(as.data.frame(man_comparison), row.names = FALSE)
+
+# ============================================================================
+# 6. SUMMARY: DEEP vs UNDERNEATH vs MAN
+# ============================================================================
+
+zone_type_break <- model_data_full %>%
+  left_join(coverage_by_play, by = c("game_id", "play_id")) %>%
+  left_join(player_assignments, by = c("game_id", "play_id", "nfl_id")) %>%
+  filter(coverage_scheme %in% cover_2_4, !is.na(coverage_responsibility.y)) %>%
+  mutate(
+    zone_type = case_when(
+      coverage_responsibility.y %in% c("THIRD", "HALF", "QUARTER", "POST") ~ "DEEP",
+      coverage_responsibility.y %in% c("FLAT", "CURL FLAT", "HOOK CURL", "HOLE") ~ "UNDERNEATH",
+      coverage_responsibility.y == "MAN" ~ "MAN",
+      TRUE ~ "OTHER"
+    )
+  ) %>%
+  group_by(coverage_scheme, zone_type) %>%
+  summarize(
+    n_plays = n(),
+    break_rate = round(mean(breaks_on_ball, na.rm = TRUE) * 100, 1),
+    break_rate_oe = round((mean(breaks_on_ball, na.rm = TRUE) - mean(pred_break_prob, na.rm = TRUE)) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  filter(n_plays >= 20)
+
+zone_type_frames <- speed_model_full %>%
+  left_join(coverage_by_play, by = c("game_id", "play_id")) %>%
+  left_join(player_assignments, by = c("game_id", "play_id", "nfl_id")) %>%
+  filter(coverage_scheme %in% cover_2_4, !is.na(coverage_responsibility.y)) %>%
+  mutate(
+    zone_type = case_when(
+      coverage_responsibility.y %in% c("THIRD", "HALF", "QUARTER", "POST") ~ "DEEP",
+      coverage_responsibility.y %in% c("FLAT", "CURL FLAT", "HOOK CURL", "HOLE") ~ "UNDERNEATH",
+      coverage_responsibility.y == "MAN" ~ "MAN",
+      TRUE ~ "OTHER"
+    )
+  ) %>%
+  group_by(coverage_scheme, zone_type) %>%
+  summarize(
+    n_breaks = n(),
+    avg_frames = round(mean(anticipation_speed, na.rm = TRUE), 2),
+    frames_oe = round(mean(anticipation_speed - pred_speed, na.rm = TRUE), 2),
+    .groups = "drop"
+  )
+
+zone_type_comparison <- zone_type_break %>%
+  left_join(zone_type_frames, by = c("coverage_scheme", "zone_type")) %>%
+  arrange(zone_type, coverage_scheme)
+
+cat("\n============================================================\n")
+cat("   DEEP vs UNDERNEATH vs MAN - COVER 2 vs COVER 4\n")
+cat("============================================================\n\n")
+print(as.data.frame(zone_type_comparison), row.names = FALSE)
+
+assignment_full %>%
+  filter(coverage_scheme == "COVER 4")
+
+# ============================================================================
+# Save
+# ============================================================================
+
+write.csv(overall_scheme, "cover2_vs_cover4_overall.csv", row.names = FALSE)
+write.csv(assignment_full, "cover2_vs_cover4_by_assignment.csv", row.names = FALSE)
+write.csv(zone_type_comparison, "cover2_vs_cover4_zone_type.csv", row.names = FALSE)
+
+cat("\nSaved CSVs\n")
+```
+

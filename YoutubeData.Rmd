@@ -1,0 +1,581 @@
+Viz Data
+```{r}
+library(dplyr)
+library(xgboost)
+library(nflreadr)
+
+# ============================================================================
+# Setup
+# ============================================================================
+
+players <- load_players()
+
+model_data_full$game_id <- as.character(model_data_full$game_id)
+speed_model_full$game_id <- as.character(speed_model_full$game_id)
+sequential_model_data_final$game_id <- as.character(sequential_model_data_final$game_id)
+modeling_data$game_id <- as.character(modeling_data$game_id)
+
+# Define the two plays
+negative_game_id <- "2023111209"
+negative_play_id <- 2762
+
+positive_game_id <- "2023111207"
+positive_play_id <- 4189
+
+# ============================================================================
+# Path data setup
+# ============================================================================
+
+break_frames <- modeling_data %>%
+  filter(!is.na(anticipation_frames)) %>%
+  select(game_id, play_id, nfl_id, anticipation_frame = anticipation_frames) %>%
+  distinct()
+
+sequential_features_clean <- setdiff(sequential_features, "distance_to_qb_now")
+categorical_vars <- c("player_position", "coverage_responsibility", "alignment", 
+                      "dropback_type", "play_action")
+
+# Get path data for both plays
+path_data_plays <- sequential_model_data_final %>%
+  inner_join(break_frames, by = c("game_id", "play_id", "nfl_id")) %>%
+  filter(frame_id >= anticipation_frame) %>%
+  filter((game_id == negative_game_id & play_id == negative_play_id) |
+         (game_id == positive_game_id & play_id == positive_play_id)) %>%
+  select(game_id, play_id, nfl_id, frame_id,
+         made_pass_defense, made_tackle,
+         all_of(sequential_features_clean)) %>%
+  mutate(across(all_of(categorical_vars), as.factor))
+
+# Predict with current models
+path_xgb <- path_data_plays %>%
+  mutate(across(where(is.factor), ~as.numeric(as.factor(.))))
+
+X_path <- path_xgb %>% select(all_of(sequential_features_clean)) %>% as.matrix()
+d_path <- xgb.DMatrix(data = X_path)
+
+path_data_plays$pred_prob_pd <- predict(xgb_model_pd, d_path)
+path_data_plays$pred_prob_tkl <- predict(xgb_model_tk, d_path)
+
+# ============================================================================
+# Function to get play data
+# ============================================================================
+
+get_play_data <- function(game_id_input, play_id_input) {
+  
+  # Break metrics
+ play_break <- model_data_full %>%
+    filter(game_id == game_id_input, play_id == play_id_input) %>%
+    select(nfl_id, breaks_on_ball, pred_break_prob, distance_to_ball, 
+           velocity_toward_ball, targeted_defender, coverage_responsibility)
+  
+  # Speed metrics
+  play_speed <- speed_model_full %>%
+    filter(game_id == game_id_input, play_id == play_id_input) %>%
+    mutate(frames_oe = anticipation_speed - pred_speed) %>%
+    select(nfl_id, anticipation_speed, pred_speed, frames_oe)
+  
+  # Path metrics (aggregated per player)
+  play_path <- path_data_plays %>%
+    filter(game_id == game_id_input, play_id == play_id_input) %>%
+    group_by(nfl_id) %>%
+    arrange(frame_id) %>%
+    summarize(
+      made_pass_defense = max(made_pass_defense, na.rm = TRUE),
+      made_tackle = max(made_tackle, na.rm = TRUE),
+      pd_start = round(first(pred_prob_pd), 3),
+      pd_end = round(last(pred_prob_pd), 3),
+      pd_gain = round(last(pred_prob_pd) - first(pred_prob_pd), 3),
+      tkl_start = round(first(pred_prob_tkl), 3),
+      tkl_end = round(last(pred_prob_tkl), 3),
+      tkl_gain = round(last(pred_prob_tkl) - first(pred_prob_tkl), 3),
+      .groups = "drop"
+    )
+  
+  # Frame by frame data
+  frame_by_frame <- path_data_plays %>%
+    filter(game_id == game_id_input, play_id == play_id_input) %>%
+    left_join(players %>% mutate(nfl_id = as.numeric(nfl_id)) %>% select(nfl_id, display_name, position), by = "nfl_id") %>%
+    mutate(
+      pred_pass_def = round(pred_prob_pd, 3),
+      pred_tackle = round(pred_prob_tkl, 3),
+      distance_to_ball_now = round(distance_to_ball_now, 1),
+      distance_to_receiver = round(distance_to_receiver, 1),
+      velocity_toward_ball_now = round(velocity_toward_ball_now, 2),
+      closure_rate = round(closure_rate, 2),
+      path_efficiency_so_far = round(path_efficiency_so_far, 3)
+    ) %>%
+    select(nfl_id, display_name, position, frame_id, coverage_responsibility,
+           made_pass_defense, made_tackle, pred_pass_def, pred_tackle,
+           distance_to_ball_now, distance_to_receiver, velocity_toward_ball_now, 
+           closure_rate, path_efficiency_so_far, frames_until_arrival) %>%
+    arrange(nfl_id, frame_id)
+  
+  # Combined defender data
+  all_defenders <- play_break %>%
+    left_join(play_speed, by = "nfl_id") %>%
+    left_join(play_path, by = "nfl_id") %>%
+    left_join(players %>% mutate(nfl_id = as.numeric(nfl_id)) %>% select(nfl_id, display_name, position), by = "nfl_id") %>%
+    mutate(
+      break_status = ifelse(breaks_on_ball == 1, "BROKE", "DID NOT BREAK"),
+      break_prob = round(pred_break_prob, 3),
+      frames_oe = round(frames_oe, 2),
+      should_have_broken = ifelse(breaks_on_ball == 0 & pred_break_prob > 0.40, "YES", "")
+    ) %>%
+    select(nfl_id, display_name, position, coverage_responsibility,
+           break_status, breaks_on_ball, break_prob, should_have_broken,
+           anticipation_speed, pred_speed, frames_oe,
+           distance_to_ball, velocity_toward_ball, targeted_defender,
+           pd_start, pd_end, pd_gain, tkl_start, tkl_end, tkl_gain,
+           made_pass_defense, made_tackle) %>%
+    arrange(desc(breaks_on_ball), desc(break_prob))
+  
+  return(list(data = all_defenders, frames = frame_by_frame))
+}
+
+# ============================================================================
+# Get data for both plays
+# ============================================================================
+
+negative_result <- get_play_data(negative_game_id, negative_play_id)
+negative_play_data <- negative_result$data
+negative_play_frames <- negative_result$frames
+
+positive_result <- get_play_data(positive_game_id, positive_play_id)
+positive_play_data <- positive_result$data
+positive_play_frames <- positive_result$frames
+
+# ============================================================================
+# Print results
+# ============================================================================
+
+cat("\n=== NEGATIVE PLAY DATA (Game:", negative_game_id, "Play:", negative_play_id, ") ===\n")
+print(as.data.frame(negative_play_data), row.names = FALSE)
+
+cat("\n=== NEGATIVE PLAY FRAMES ===\n")
+print(as.data.frame(negative_play_frames), row.names = FALSE)
+
+cat("\n=== POSITIVE PLAY DATA (Game:", positive_game_id, "Play:", positive_play_id, ") ===\n")
+print(as.data.frame(positive_play_data), row.names = FALSE)
+
+cat("\n=== POSITIVE PLAY FRAMES ===\n")
+print(as.data.frame(positive_play_frames), row.names = FALSE)
+```
+Tables
+```{r}
+library(dplyr)
+library(gt)
+library(gtExtras)
+library(xgboost)
+library(nflreadr)
+
+# ============================================================================
+# Setup
+# ============================================================================
+
+players <- load_players()
+
+model_data_full$game_id <- as.character(model_data_full$game_id)
+speed_model_full$game_id <- as.character(speed_model_full$game_id)
+sequential_model_data_final$game_id <- as.character(sequential_model_data_final$game_id)
+modeling_data$game_id <- as.character(modeling_data$game_id)
+
+# Define the two plays
+negative_game_id <- "2023111209"
+negative_play_id <- 2762
+
+positive_game_id <- "2023111207"
+positive_play_id <- 4189
+
+# ============================================================================
+# Calculate league-wide percentiles first (min 20 plays)
+# ============================================================================
+
+# Break metrics for all players (min 20 opportunities)
+all_break_metrics <- model_data_full %>%
+  group_by(nfl_id) %>%
+  summarize(
+    n_opps = n(),
+    break_rate_oe = mean(breaks_on_ball) - mean(pred_break_prob),
+    .groups = "drop"
+  ) %>%
+  filter(n_opps >= 20) %>%
+  mutate(break_oe_pctl = round(percent_rank(break_rate_oe) * 100, 0))
+
+# Speed metrics for all players (min 20 breaks)
+all_speed_metrics <- speed_model_full %>%
+  group_by(nfl_id) %>%
+  summarize(
+    n_breaks = n(),
+    frames_oe = mean(anticipation_speed - pred_speed),
+    .groups = "drop"
+  ) %>%
+  filter(n_breaks >= 20) %>%
+  mutate(frames_oe_pctl = round(percent_rank(-frames_oe) * 100, 0))
+
+# ============================================================================
+# Path data setup
+# ============================================================================
+
+break_frames <- modeling_data %>%
+  filter(!is.na(anticipation_frames)) %>%
+  select(game_id, play_id, nfl_id, anticipation_frame = anticipation_frames) %>%
+  distinct()
+
+sequential_features_clean <- setdiff(sequential_features, "distance_to_qb_now")
+categorical_vars <- c("player_position", "coverage_responsibility", "alignment", 
+                      "dropback_type", "play_action")
+
+# Get ALL path data for percentiles
+all_path_data <- sequential_model_data_final %>%
+  inner_join(break_frames, by = c("game_id", "play_id", "nfl_id")) %>%
+  filter(frame_id >= anticipation_frame) %>%
+  select(game_id, play_id, nfl_id, frame_id,
+         made_pass_defense, made_tackle,
+         all_of(sequential_features_clean)) %>%
+  mutate(across(all_of(categorical_vars), as.factor))
+
+path_xgb <- all_path_data %>%
+  mutate(across(where(is.factor), ~as.numeric(as.factor(.))))
+
+X_path <- path_xgb %>% select(all_of(sequential_features_clean)) %>% as.matrix()
+d_path <- xgb.DMatrix(data = X_path)
+
+all_path_data$pred_prob_pd <- predict(xgb_model_pd, d_path)
+all_path_data$pred_prob_tkl <- predict(xgb_model_tk, d_path)
+
+# Aggregate path metrics by player for percentiles (min 20 plays)
+all_path_metrics <- all_path_data %>%
+  group_by(game_id, play_id, nfl_id) %>%
+  arrange(frame_id) %>%
+  summarize(
+    pd_gain = last(pred_prob_pd) - first(pred_prob_pd),
+    tkl_gain = last(pred_prob_tkl) - first(pred_prob_tkl),
+    .groups = "drop"
+  ) %>%
+  group_by(nfl_id) %>%
+  summarize(
+    n_path_plays = n(),
+    avg_pd_gain = mean(pd_gain, na.rm = TRUE),
+    avg_tkl_gain = mean(tkl_gain, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n_path_plays >= 20) %>%
+  mutate(
+    pd_gain_pctl = round(percent_rank(avg_pd_gain) * 100, 0),
+    tkl_gain_pctl = round(percent_rank(avg_tkl_gain) * 100, 0)
+  )
+
+# ============================================================================
+# Function to get play table data for players who broke
+# ============================================================================
+
+get_break_table <- function(game_id_input, play_id_input) {
+  
+  # Get players who broke on this play
+  broke_players <- model_data_full %>%
+    filter(game_id == game_id_input, play_id == play_id_input, breaks_on_ball == 1) %>%
+    mutate(
+      break_oe_num = round((breaks_on_ball - pred_break_prob) * 100, 1),
+      break_oe = paste0(ifelse(break_oe_num > 0, "+", ""), break_oe_num, "%")
+    ) %>%
+    select(nfl_id, break_oe, break_oe_num)
+  
+  # Get speed metrics for those who broke
+  speed_metrics <- speed_model_full %>%
+    filter(game_id == game_id_input, play_id == play_id_input) %>%
+    mutate(frames_oe = round(anticipation_speed - pred_speed, 2)) %>%
+    select(nfl_id, frames_oe)
+  
+  # Get path predictions at start, middle, end
+  path_positions <- all_path_data %>%
+    filter(game_id == game_id_input, play_id == play_id_input) %>%
+    filter(nfl_id %in% broke_players$nfl_id) %>%
+    group_by(nfl_id) %>%
+    arrange(frame_id) %>%
+    summarize(
+      # Start
+      pd_start = round(first(pred_prob_pd) * 100, 1),
+      tkl_start = round(first(pred_prob_tkl) * 100, 1),
+      # Middle
+      pd_mid = round(pred_prob_pd[ceiling(n() / 2)] * 100, 1),
+      tkl_mid = round(pred_prob_tkl[ceiling(n() / 2)] * 100, 1),
+      # End
+      pd_end = round(last(pred_prob_pd) * 100, 1),
+      tkl_end = round(last(pred_prob_tkl) * 100, 1),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      # Calculate change from start for coloring
+      pd_mid_change = pd_mid - pd_start,
+      pd_end_change = pd_end - pd_start,
+      tkl_mid_change = tkl_mid - tkl_start,
+      tkl_end_change = tkl_end - tkl_start
+    )
+  
+  # Get player info
+  player_info <- input %>%
+    filter(nfl_id %in% broke_players$nfl_id) %>%
+    select(nfl_id, player_name, player_position) %>%
+    distinct(nfl_id, .keep_all = TRUE)
+  
+  # Get headshots
+  player_headshots <- players %>%
+    mutate(nfl_id = as.numeric(nfl_id)) %>%
+    select(nfl_id, headshot)
+  
+  # Combine everything
+  table_data <- broke_players %>%
+    left_join(speed_metrics, by = "nfl_id") %>%
+    left_join(all_break_metrics %>% select(nfl_id, break_oe_pctl), by = "nfl_id") %>%
+    left_join(all_speed_metrics %>% select(nfl_id, frames_oe_pctl), by = "nfl_id") %>%
+    left_join(path_positions, by = "nfl_id") %>%
+    left_join(all_path_metrics %>% select(nfl_id, pd_gain_pctl, tkl_gain_pctl), by = "nfl_id") %>%
+    left_join(player_info, by = "nfl_id") %>%
+    left_join(player_headshots, by = "nfl_id") %>%
+    select(
+      headshot,
+      player_name,
+      player_position,
+      # Anticipation metrics
+      break_oe, break_oe_num, break_oe_pctl,
+      frames_oe, frames_oe_pctl,
+      # Path metrics - PD
+      pd_start, pd_mid, pd_end, pd_mid_change, pd_end_change, pd_gain_pctl,
+      # Path metrics - TKL
+      tkl_start, tkl_mid, tkl_end, tkl_mid_change, tkl_end_change, tkl_gain_pctl
+    ) %>%
+    arrange(desc(pd_end))
+  
+  return(table_data)
+}
+
+# ============================================================================
+# Get data for both plays
+# ============================================================================
+
+negative_table <- get_break_table(negative_game_id, negative_play_id)
+positive_table <- get_break_table(positive_game_id, positive_play_id)
+
+cat("Negative play - players who broke:", nrow(negative_table), "\n")
+cat("Positive play - players who broke:", nrow(positive_table), "\n")
+
+# ============================================================================
+# Calculate dynamic domains for color scales
+# ============================================================================
+
+neg_change_max <- max(abs(c(negative_table$pd_mid_change, negative_table$pd_end_change,
+                            negative_table$tkl_mid_change, negative_table$tkl_end_change)), na.rm = TRUE)
+
+pos_change_max <- max(abs(c(positive_table$pd_mid_change, positive_table$pd_end_change,
+                            positive_table$tkl_mid_change, positive_table$tkl_end_change)), na.rm = TRUE)
+
+# ============================================================================
+# Create GT table for Negative Play
+# ============================================================================
+
+negative_gt <- negative_table %>%
+  gt() %>%
+  tab_header(
+    title = md("**Negative EPA Play - Defenders Who Broke**"),
+    subtitle = paste0("Game: ", negative_game_id, " | Play: ", negative_play_id)
+  ) %>%
+  gt_img_rows(columns = headshot, height = 35, img_source = "web") %>%
+  cols_hide(columns = c(break_oe_num, pd_mid_change, pd_end_change, tkl_mid_change, tkl_end_change)) %>%
+  cols_label(
+    headshot = "",
+    player_name = "Player",
+    player_position = "Pos",
+    break_oe = "O/E",
+    break_oe_pctl = "Pctl",
+    frames_oe = "O/E",
+    frames_oe_pctl = "Pctl",
+    pd_start = "Start",
+    pd_mid = "Mid",
+    pd_end = "End",
+    pd_gain_pctl = "Pctl",
+    tkl_start = "Start",
+    tkl_mid = "Mid",
+    tkl_end = "End",
+    tkl_gain_pctl = "Pctl"
+  ) %>%
+  tab_spanner(label = "Break %", columns = c(break_oe, break_oe_pctl)) %>%
+  tab_spanner(label = "Frames", columns = c(frames_oe, frames_oe_pctl)) %>%
+  tab_spanner(label = "Pass Def Prob (%)", columns = c(pd_start, pd_mid, pd_end, pd_gain_pctl)) %>%
+  tab_spanner(label = "Tackle Prob (%)", columns = c(tkl_start, tkl_mid, tkl_end, tkl_gain_pctl)) %>%
+  cols_align(align = "center", columns = everything()) %>%
+  cols_align(align = "left", columns = player_name) %>%
+  # Start columns - colored by actual probability (higher = greener = better position)
+  data_color(
+    columns = c(pd_start, tkl_start),
+    palette = c("#FADBD8", "#FFFFFF", "#D4EFDF", "#27AE60"),
+    domain = c(0, 100)
+  ) %>%
+  # Mid columns - colored by change from start (dynamic domain)
+  data_color(
+    columns = pd_mid_change,
+    target_columns = pd_mid,
+    palette = c("#E74C3C", "#FADBD8", "#FFFFFF", "#D4EFDF", "#27AE60"),
+    domain = c(-neg_change_max, neg_change_max)
+  ) %>%
+  data_color(
+    columns = tkl_mid_change,
+    target_columns = tkl_mid,
+    palette = c("#E74C3C", "#FADBD8", "#FFFFFF", "#D4EFDF", "#27AE60"),
+    domain = c(-neg_change_max, neg_change_max)
+  ) %>%
+  # End columns - colored by change from start (dynamic domain)
+  data_color(
+    columns = pd_end_change,
+    target_columns = pd_end,
+    palette = c("#E74C3C", "#FADBD8", "#FFFFFF", "#D4EFDF", "#27AE60"),
+    domain = c(-neg_change_max, neg_change_max)
+  ) %>%
+  data_color(
+    columns = tkl_end_change,
+    target_columns = tkl_end,
+    palette = c("#E74C3C", "#FADBD8", "#FFFFFF", "#D4EFDF", "#27AE60"),
+    domain = c(-neg_change_max, neg_change_max)
+  ) %>%
+  # Break O/E coloring
+  data_color(
+    columns = break_oe_num,
+    target_columns = break_oe,
+    palette = c("#FADBD8", "#FFFFFF", "#D4EFDF"),
+    domain = c(-50, 50)
+  ) %>%
+  # Frames O/E coloring (negative = good)
+  data_color(
+    columns = frames_oe,
+    palette = c("#D4EFDF", "#FFFFFF", "#FADBD8"),
+    domain = c(-5, 5)
+  ) %>%
+  # Percentile coloring
+  data_color(
+    columns = c(break_oe_pctl, frames_oe_pctl, pd_gain_pctl, tkl_gain_pctl),
+    palette = c("#E74C3C", "#F5B041", "#F7DC6F", "#82E0AA", "#27AE60"),
+    domain = c(0, 100)
+  ) %>%
+  tab_style(style = cell_text(weight = "bold"), locations = cells_column_labels()) %>%
+  tab_options(
+    table.font.size = px(11),
+    heading.background.color = "#27AE60",
+    heading.title.font.size = px(14),
+    column_labels.background.color = "#2ECC71",
+    column_labels.font.weight = "bold",
+    data_row.padding = px(4)
+  ) %>%
+  tab_source_note(
+    source_note = md("*Note: O/E and probability values (Start/Mid/End) are for this specific play. Start colored by probability; Mid/End colored by change from Start. Percentiles (Pctl) reflect season-long performance (min. 20 plays).*")
+  )
+
+# ============================================================================
+# Create GT table for Positive Play
+# ============================================================================
+
+positive_gt <- positive_table %>%
+  gt() %>%
+  tab_header(
+    title = md("**Positive EPA Play - Defenders Who Broke**"),
+    subtitle = paste0("Game: ", positive_game_id, " | Play: ", positive_play_id)
+  ) %>%
+  gt_img_rows(columns = headshot, height = 35, img_source = "web") %>%
+  cols_hide(columns = c(break_oe_num, pd_mid_change, pd_end_change, tkl_mid_change, tkl_end_change)) %>%
+  cols_label(
+    headshot = "",
+    player_name = "Player",
+    player_position = "Pos",
+    break_oe = "O/E",
+    break_oe_pctl = "Pctl",
+    frames_oe = "O/E",
+    frames_oe_pctl = "Pctl",
+    pd_start = "Start",
+    pd_mid = "Mid",
+    pd_end = "End",
+    pd_gain_pctl = "Pctl",
+    tkl_start = "Start",
+    tkl_mid = "Mid",
+    tkl_end = "End",
+    tkl_gain_pctl = "Pctl"
+  ) %>%
+  tab_spanner(label = "Break %", columns = c(break_oe, break_oe_pctl)) %>%
+  tab_spanner(label = "Frames", columns = c(frames_oe, frames_oe_pctl)) %>%
+  tab_spanner(label = "Pass Def Prob (%)", columns = c(pd_start, pd_mid, pd_end, pd_gain_pctl)) %>%
+  tab_spanner(label = "Tackle Prob (%)", columns = c(tkl_start, tkl_mid, tkl_end, tkl_gain_pctl)) %>%
+  cols_align(align = "center", columns = everything()) %>%
+  cols_align(align = "left", columns = player_name) %>%
+  # Start columns - colored by actual probability (higher = greener = better position)
+  data_color(
+    columns = c(pd_start, tkl_start),
+    palette = c("#FADBD8", "#FFFFFF", "#D4EFDF", "#27AE60"),
+    domain = c(0, 100)
+  ) %>%
+  # Mid columns - colored by change from start (dynamic domain)
+  data_color(
+    columns = pd_mid_change,
+    target_columns = pd_mid,
+    palette = c("#E74C3C", "#FADBD8", "#FFFFFF", "#D4EFDF", "#27AE60"),
+    domain = c(-pos_change_max, pos_change_max)
+  ) %>%
+  data_color(
+    columns = tkl_mid_change,
+    target_columns = tkl_mid,
+    palette = c("#E74C3C", "#FADBD8", "#FFFFFF", "#D4EFDF", "#27AE60"),
+    domain = c(-pos_change_max, pos_change_max)
+  ) %>%
+  # End columns - colored by change from start (dynamic domain)
+  data_color(
+    columns = pd_end_change,
+    target_columns = pd_end,
+    palette = c("#E74C3C", "#FADBD8", "#FFFFFF", "#D4EFDF", "#27AE60"),
+    domain = c(-pos_change_max, pos_change_max)
+  ) %>%
+  data_color(
+    columns = tkl_end_change,
+    target_columns = tkl_end,
+    palette = c("#E74C3C", "#FADBD8", "#FFFFFF", "#D4EFDF", "#27AE60"),
+    domain = c(-pos_change_max, pos_change_max)
+  ) %>%
+  # Break O/E coloring
+  data_color(
+    columns = break_oe_num,
+    target_columns = break_oe,
+    palette = c("#FADBD8", "#FFFFFF", "#D4EFDF"),
+    domain = c(-50, 50)
+  ) %>%
+  # Frames O/E coloring (negative = good)
+  data_color(
+    columns = frames_oe,
+    palette = c("#D4EFDF", "#FFFFFF", "#FADBD8"),
+    domain = c(-5, 5)
+  ) %>%
+  # Percentile coloring
+  data_color(
+    columns = c(break_oe_pctl, frames_oe_pctl, pd_gain_pctl, tkl_gain_pctl),
+    palette = c("#E74C3C", "#F5B041", "#F7DC6F", "#82E0AA", "#27AE60"),
+    domain = c(0, 100)
+  ) %>%
+  tab_style(style = cell_text(weight = "bold"), locations = cells_column_labels()) %>%
+  tab_options(
+    table.font.size = px(11),
+    heading.background.color = "#E74C3C",
+    heading.title.font.size = px(14),
+    column_labels.background.color = "#C0392B",
+    column_labels.font.weight = "bold",
+    data_row.padding = px(4)
+  ) %>%
+  tab_source_note(
+    source_note = md("*Note: O/E and probability values (Start/Mid/End) are for this specific play. Start colored by probability; Mid/End colored by change from Start. Percentiles (Pctl) reflect season-long performance (min. 20 plays).*")
+  )
+
+# Print tables
+print(negative_gt)
+print(positive_gt)
+
+# Save tables
+gtsave(negative_gt, "negative_play_breakers.png", vwidth = 1100, vheight = 400)
+gtsave(positive_gt, "positive_play_breakers.png", vwidth = 1100, vheight = 400)
+
+negative_play_data
+positive_play_data
+```
+
