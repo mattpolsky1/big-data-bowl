@@ -29,7 +29,7 @@ These files apply the trained models across the full dataset and produce aggrega
 Once local data paths are set, these analysis files should be run first, as they assume model outputs already exist.
 
 ## Shiny App
-`DataPrep.Rmd`  
+`app_code.Rmd`  
 `app.R`
 
-These files handle data preparation and power the Shiny app used to explore anticipation and impact metrics interactively.
+These files handle data preparation & pre-loads GIFs to power the Shiny app used to explore anticipation and impact metrics interactively.
