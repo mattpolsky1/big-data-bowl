@@ -1,0 +1,729 @@
+library(shiny)
+library(shinydashboard)
+library(dplyr)
+library(ggplot2)
+library(gganimate)
+library(ggimage)
+library(ggtext)
+library(gt)
+library(gtExtras)
+library(xgboost)
+library(nflreadr)
+library(gifski)
+library(base64enc)
+# ============================================================================
+# PRE-PROCESSING
+# ============================================================================
+
+cat("Step 1: Loading players...\n")
+players <- load_players()
+
+cat("Step 2: Type conversions...\n")
+model_data_full$game_id <- as.character(model_data_full$game_id)
+speed_model_full$game_id <- as.character(speed_model_full$game_id)
+sequential_model_data_final$game_id <- as.character(sequential_model_data_final$game_id)
+modeling_data$game_id <- as.character(modeling_data$game_id)
+
+cat("Step 3: Getting plays with breaks...\n")
+plays_with_breaks <- model_data_full %>%
+  filter(breaks_on_ball == 1) %>%
+  select(game_id, play_id) %>%
+  distinct()
+
+cat("Step 4: Getting EPA...\n")
+plays_with_epa <- supp %>%
+  mutate(game_id = as.character(game_id)) %>%
+  inner_join(plays_with_breaks, by = c("game_id", "play_id")) %>%
+  filter(!is.na(expected_points_added)) %>%
+  select(game_id, play_id, expected_points_added) %>%
+  distinct()
+
+cat("Step 5: Selecting 20 plays (10 high EPA, 10 low EPA)...\n")
+high_epa_plays <- plays_with_epa %>% arrange(desc(expected_points_added)) %>% head(10)
+low_epa_plays <- plays_with_epa %>% arrange(expected_points_added) %>% head(10)
+
+selected_plays <- bind_rows(
+  high_epa_plays %>% mutate(epa_type = "High EPA (Bad Defense)"),
+  low_epa_plays %>% mutate(epa_type = "Low EPA (Good Defense)")
+)
+
+cat("Selected", nrow(selected_plays), "plays\n")
+
+# ============================================================================
+# COMPUTE LEAGUE-WIDE PERCENTILES (DISTRIBUTION FROM 20+ PLAYERS, APPLY TO ALL)
+# ============================================================================
+
+cat("Step 6: Computing league-wide percentiles...\n")
+
+# Break metrics - all players
+all_break_raw <- model_data_full %>%
+  group_by(nfl_id) %>%
+  summarize(n_opps = n(), break_rate_oe = mean(breaks_on_ball) - mean(pred_break_prob), .groups = "drop")
+
+qualified_break <- all_break_raw %>% filter(n_opps >= 20)
+break_ecdf <- ecdf(qualified_break$break_rate_oe)
+all_break_metrics <- all_break_raw %>%
+  mutate(break_oe_pctl = round(break_ecdf(break_rate_oe) * 100, 0))
+
+# Speed metrics - all players
+all_speed_raw <- speed_model_full %>%
+  group_by(nfl_id) %>%
+  summarize(n_breaks = n(), avg_frames_oe = mean(anticipation_speed - pred_speed), .groups = "drop")
+
+qualified_speed <- all_speed_raw %>% filter(n_breaks >= 20)
+speed_ecdf <- ecdf(-qualified_speed$avg_frames_oe)
+all_speed_metrics <- all_speed_raw %>%
+  mutate(frames_oe_pctl = round(speed_ecdf(-avg_frames_oe) * 100, 0))
+
+# ============================================================================
+# PATH PREDICTIONS - COMPUTE ON ALL DATA FOR PERCENTILES
+# ============================================================================
+
+cat("Step 7: Getting ALL break frames...\n")
+break_frames_league <- modeling_data %>%
+  filter(!is.na(anticipation_frames)) %>%
+  select(game_id, play_id, nfl_id, anticipation_frame = anticipation_frames) %>%
+  distinct()
+
+sequential_features_clean <- setdiff(sequential_features, "distance_to_qb_now")
+categorical_vars <- c("player_position", "coverage_responsibility", "alignment", 
+                      "dropback_type", "play_action")
+
+cat("Step 8: Getting ALL path data...\n")
+path_data_league <- sequential_model_data_final %>%
+  inner_join(break_frames_league, by = c("game_id", "play_id", "nfl_id")) %>%
+  filter(frame_id >= anticipation_frame) %>%
+  select(game_id, play_id, nfl_id, frame_id, anticipation_frame,
+         made_pass_defense, made_tackle, all_of(sequential_features_clean)) %>%
+  mutate(across(all_of(categorical_vars), as.factor))
+
+cat("League path data rows:", nrow(path_data_league), "\n")
+
+cat("Step 9: Running XGBoost predictions...\n")
+path_xgb_league <- path_data_league %>%
+  mutate(across(where(is.factor), ~as.numeric(as.factor(.))))
+
+X_path_league <- path_xgb_league %>% select(all_of(sequential_features_clean)) %>% as.matrix()
+d_path_league <- xgb.DMatrix(data = X_path_league)
+
+path_data_league$pred_pd <- predict(xgb_model_pd, d_path_league)
+path_data_league$pred_tkl <- predict(xgb_model_tk, d_path_league)
+
+cat("Step 10: Computing path percentiles...\n")
+path_gains_league <- path_data_league %>%
+  group_by(game_id, play_id, nfl_id) %>%
+  arrange(frame_id) %>%
+  summarize(
+    pd_gain_play = last(pred_pd) - first(pred_pd),
+    tkl_gain_play = last(pred_tkl) - first(pred_tkl),
+    .groups = "drop"
+  )
+
+all_path_raw <- path_gains_league %>%
+  group_by(nfl_id) %>%
+  summarize(
+    n_path_plays = n(),
+    avg_pd_gain = mean(pd_gain_play, na.rm = TRUE),
+    avg_tkl_gain = mean(tkl_gain_play, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+qualified_path <- all_path_raw %>% filter(n_path_plays >= 20)
+pd_ecdf <- ecdf(qualified_path$avg_pd_gain)
+tkl_ecdf <- ecdf(qualified_path$avg_tkl_gain)
+
+all_path_metrics <- all_path_raw %>%
+  mutate(
+    pd_gain_pctl = round(pd_ecdf(avg_pd_gain) * 100, 0),
+    tkl_gain_pctl = round(tkl_ecdf(avg_tkl_gain) * 100, 0)
+  )
+
+cat("Players with path metrics:", nrow(all_path_metrics), "\n")
+
+# ============================================================================
+# FILTER TO SELECTED PLAYS
+# ============================================================================
+
+cat("Step 11: Filtering to selected plays...\n")
+path_data_selected <- path_data_league %>%
+  inner_join(selected_plays %>% select(game_id, play_id), by = c("game_id", "play_id"))
+
+start_probs <- path_data_selected %>%
+  group_by(game_id, play_id, nfl_id) %>%
+  arrange(frame_id) %>%
+  summarize(pd_start = first(pred_pd), tkl_start = first(pred_tkl), .groups = "drop")
+
+path_data_selected <- path_data_selected %>%
+  left_join(start_probs, by = c("game_id", "play_id", "nfl_id")) %>%
+  mutate(pd_gain = pred_pd - pd_start, tkl_gain = pred_tkl - tkl_start)
+
+# Player info
+player_info_all <- input %>%
+  select(nfl_id, player_name, player_position) %>%
+  distinct(nfl_id, .keep_all = TRUE)
+
+player_headshots <- players %>%
+  mutate(nfl_id = as.numeric(nfl_id)) %>%
+  select(nfl_id, headshot)
+
+# ============================================================================
+# ALL DEFENDERS (BREAKERS + NON-BREAKERS)
+# ============================================================================
+
+cat("Step 12: Getting all defenders...\n")
+
+all_defenders_selected <- model_data_full %>%
+  inner_join(selected_plays %>% select(game_id, play_id), by = c("game_id", "play_id")) %>%
+  mutate(break_oe = round((breaks_on_ball - pred_break_prob) * 100, 1)) %>%
+  select(game_id, play_id, nfl_id, breaks_on_ball, break_oe)
+
+speed_metrics_selected <- speed_model_full %>%
+  inner_join(selected_plays %>% select(game_id, play_id), by = c("game_id", "play_id")) %>%
+  mutate(frames_oe = round(anticipation_speed - pred_speed, 2)) %>%
+  select(game_id, play_id, nfl_id, frames_oe)
+
+# ============================================================================
+# SUMMARY STATS (BREAKERS + NON-BREAKERS)
+# ============================================================================
+
+cat("Step 13: Computing summary stats...\n")
+
+# Breakers
+breaker_stats <- path_data_selected %>%
+  left_join(player_info_all, by = "nfl_id") %>%
+  left_join(player_headshots, by = "nfl_id") %>%
+  group_by(game_id, play_id, nfl_id) %>%
+  arrange(frame_id) %>%
+  summarize(
+    player_name = first(player_name),
+    player_position = first(player_position.x),
+    headshot = first(headshot),
+    pd_start = round(first(pred_pd) * 100, 1),
+    pd_mid = round(pred_pd[ceiling(n()/2)] * 100, 1),
+    pd_end = round(last(pred_pd) * 100, 1),
+    tkl_start = round(first(pred_tkl) * 100, 1),
+    tkl_mid = round(pred_tkl[ceiling(n()/2)] * 100, 1),
+    tkl_end = round(last(pred_tkl) * 100, 1),
+    made_pd = max(made_pass_defense),
+    made_tkl = max(made_tackle),
+    .groups = "drop"
+  ) %>%
+  mutate(broke_on_ball = 1, pd_change = pd_end - pd_start, tkl_change = tkl_end - tkl_start)
+
+# Non-breakers
+non_breaker_stats <- all_defenders_selected %>%
+  filter(breaks_on_ball == 0) %>%
+  left_join(player_info_all, by = "nfl_id") %>%
+  left_join(player_headshots, by = "nfl_id") %>%
+  mutate(
+    broke_on_ball = 0,
+    pd_start = NA_real_, pd_mid = NA_real_, pd_end = NA_real_,
+    tkl_start = NA_real_, tkl_mid = NA_real_, tkl_end = NA_real_,
+    pd_change = NA_real_, tkl_change = NA_real_,
+    made_pd = NA_integer_, made_tkl = NA_integer_
+  ) %>%
+  select(game_id, play_id, nfl_id, player_name, player_position, headshot,
+         broke_on_ball, pd_start, pd_mid, pd_end, tkl_start, tkl_mid, tkl_end,
+         pd_change, tkl_change, made_pd, made_tkl)
+
+# Combine
+summary_stats_all <- bind_rows(breaker_stats, non_breaker_stats) %>%
+  left_join(all_defenders_selected %>% select(game_id, play_id, nfl_id, break_oe), 
+            by = c("game_id", "play_id", "nfl_id")) %>%
+  left_join(speed_metrics_selected, by = c("game_id", "play_id", "nfl_id")) %>%
+  mutate(break_oe_fmt = paste0(ifelse(break_oe > 0, "+", ""), break_oe, "%")) %>%
+  left_join(all_break_metrics %>% select(nfl_id, break_oe_pctl), by = "nfl_id") %>%
+  left_join(all_speed_metrics %>% select(nfl_id, frames_oe_pctl), by = "nfl_id") %>%
+  left_join(all_path_metrics %>% select(nfl_id, pd_gain_pctl, tkl_gain_pctl), by = "nfl_id")
+
+cat("Summary stats rows:", nrow(summary_stats_all), "\n")
+
+# ============================================================================
+# TRACKING DATA
+# ============================================================================
+
+cat("Step 14: Preparing tracking data...\n")
+
+anticipation_data_all <- anticipation_std %>%
+  mutate(game_id = as.numeric(game_id)) %>%
+  inner_join(selected_plays %>% mutate(game_id = as.numeric(game_id)) %>% select(game_id, play_id), 
+             by = c("game_id", "play_id")) %>%
+  select(game_id, play_id, nfl_id, anticipation_frames, never_on_vector) %>%
+  mutate(broke_on_ball = !is.na(anticipation_frames) & !never_on_vector)
+
+input_tracking_all <- input %>%
+  inner_join(selected_plays %>% mutate(game_id = as.numeric(game_id)) %>% select(game_id, play_id), 
+             by = c("game_id", "play_id")) %>%
+  mutate(
+    x_std = ifelse(play_direction == "left", 120 - x, x),
+    y_std = ifelse(play_direction == "left", 53.3 - y, y),
+    ball_land_x_std = ifelse(play_direction == "left", 120 - ball_land_x, ball_land_x),
+    ball_land_y_std = ifelse(play_direction == "left", 53.3 - ball_land_y, ball_land_y)
+  ) %>%
+  left_join(player_headshots, by = "nfl_id")
+
+max_input_frames <- input_tracking_all %>%
+  group_by(game_id, play_id) %>%
+  summarize(max_input_frame = max(frame_id), .groups = "drop")
+
+output_tracking_all <- output %>%
+  inner_join(selected_plays %>% mutate(game_id = as.numeric(game_id)) %>% select(game_id, play_id), 
+             by = c("game_id", "play_id")) %>%
+  left_join(input_tracking_all %>% select(game_id, play_id, play_direction) %>% distinct(),
+            by = c("game_id", "play_id")) %>%
+  left_join(max_input_frames, by = c("game_id", "play_id")) %>%
+  mutate(
+    x_std = ifelse(play_direction == "left", 120 - x, x),
+    y_std = ifelse(play_direction == "left", 53.3 - y, y),
+    frame_id_adjusted = frame_id + max_input_frame
+  )
+
+# ============================================================================
+# GIF GENERATION FUNCTION
+# ============================================================================
+
+generate_play_gif <- function(game_id_sel, play_id_sel, gif_path) {
+  
+  cat("Generating GIF for game", game_id_sel, "play", play_id_sel, "...\n")
+  
+  play_info <- plays %>%
+    mutate(old_game_id = as.numeric(old_game_id)) %>%
+    filter(old_game_id == game_id_sel, play_id == play_id_sel)
+  
+  if (nrow(play_info) == 0) return(FALSE)
+  
+  posteam <- play_info$posteam[1]
+  defteam <- play_info$defteam[1]
+  los <- 110 - play_info$yardline_100[1]
+  first_down_line <- los + play_info$ydstogo[1]
+  
+  offense_color <- teams_colors_logos$team_color[teams_colors_logos$team_abbr == posteam][1]
+  defense_color <- teams_colors_logos$team_color[teams_colors_logos$team_abbr == defteam][1]
+  team_logo <- teams_colors_logos$team_logo_wikipedia[teams_colors_logos$team_abbr == posteam][1]
+  
+  input_tracking <- input_tracking_all %>% filter(game_id == game_id_sel, play_id == play_id_sel)
+  output_tracking <- output_tracking_all %>% filter(game_id == game_id_sel, play_id == play_id_sel)
+  anticipation_data <- anticipation_data_all %>% filter(game_id == game_id_sel, play_id == play_id_sel)
+  
+  if (nrow(input_tracking) == 0) return(FALSE)
+  
+  max_input_frame <- max(input_tracking$frame_id)
+  min_input_frame <- min(input_tracking$frame_id)
+  total_input_frames <- max_input_frame - min_input_frame + 1
+  
+  anticipation_data <- anticipation_data %>%
+    mutate(anticipation_frames_adjusted = ifelse(!is.na(anticipation_frames), 
+                                                  anticipation_frames + max_input_frame, NA))
+  
+  output_player_ids <- unique(output_tracking$nfl_id)
+  fade_duration <- max(20, round(total_input_frames * 0.4))
+  fade_start_frame <- max_input_frame - fade_duration
+  
+  input_phase <- input_tracking %>%
+    mutate(
+      phase = "input", frame_id_seq = frame_id,
+      alpha = case_when(
+        nfl_id %in% output_player_ids ~ 1.0,
+        frame_id < fade_start_frame ~ 1.0,
+        TRUE ~ pmax(0, (1 - (frame_id - fade_start_frame) / (max_input_frame - fade_start_frame))^2)
+      )
+    ) %>%
+    left_join(anticipation_data, by = c("game_id", "play_id", "nfl_id")) %>%
+    select(game_id, play_id, nfl_id, frame_id_seq, x_std, y_std, 
+           player_side, player_name, headshot, phase, alpha, broke_on_ball, never_on_vector, anticipation_frames_adjusted)
+  
+  output_phase <- output_tracking %>%
+    left_join(input_tracking %>% select(game_id, play_id, nfl_id, player_side, player_name, headshot) %>% distinct(),
+              by = c("game_id", "play_id", "nfl_id")) %>%
+    left_join(anticipation_data %>% select(-game_id, -play_id), by = "nfl_id") %>%
+    mutate(phase = "output", frame_id_seq = frame_id_adjusted, alpha = 1.0) %>%
+    select(game_id, play_id, nfl_id, frame_id_seq, x_std, y_std, 
+           player_side, player_name, headshot, phase, alpha, broke_on_ball, never_on_vector, anticipation_frames_adjusted)
+  
+  combined_tracking <- bind_rows(input_phase, output_phase) %>%
+    mutate(
+      border_color = case_when(
+        tolower(player_side) == "offense" ~ "white",
+        broke_on_ball == TRUE & frame_id_seq >= anticipation_frames_adjusted ~ "#00FF00",
+        never_on_vector == TRUE ~ "#FF0000",
+        tolower(player_side) == "defense" ~ "#FFD700",
+        TRUE ~ "white"
+      )
+    ) %>%
+    filter(alpha > 0.05)
+  
+  ball_location <- input_tracking %>% filter(!is.na(ball_land_x_std))
+  output_start <- min(output_phase$frame_id_seq, na.rm = TRUE)
+  max_output_frame <- max(output_phase$frame_id_seq, na.rm = TRUE)
+  
+  if (nrow(ball_location) > 0) {
+    ball_data <- data.frame(
+      frame_id_seq = seq(output_start, max_output_frame),
+      ball_land_x_std = ball_location$ball_land_x_std[1],
+      ball_land_y_std = ball_location$ball_land_y_std[1]
+    )
+  } else {
+    ball_data <- data.frame(frame_id_seq = integer(), ball_land_x_std = numeric(), ball_land_y_std = numeric())
+  }
+  
+  xmin <- 0; xmax <- 53.3
+  ymin <- max(floor(min(combined_tracking$x_std, na.rm = TRUE)) - 5, 0)
+  ymax <- min(ceiling(max(combined_tracking$x_std, na.rm = TRUE)) + 5, 120)
+  ymin <- floor(ymin / 5) * 5; ymax <- ceiling(ymax / 5) * 5
+  
+  yard_line_positions <- seq(10, 110, by = 10)
+  yard_line_positions <- yard_line_positions[yard_line_positions >= ymin & yard_line_positions <= ymax]
+  
+  yard_line_labels <- data.frame(
+    y = yard_line_positions,
+    label = sapply(yard_line_positions, function(y) {
+      if (y <= 10 || y >= 110) return("")
+      if (y == 60) return("50")
+      if (y < 60) return(as.character(y - 10))
+      return(as.character(110 - y))
+    })
+  )
+  
+  hash_yards <- seq(max(10, ymin), min(ymax, 110), by = 1)
+  hash_marks <- data.frame(
+    x = rep(c(23.36, 29.94), times = length(hash_yards)),
+    y = rep(hash_yards, each = 2),
+    xend = rep(c(23.36, 29.94), times = length(hash_yards)),
+    yend = rep(hash_yards, each = 2) + 0.3
+  )
+  
+  all_frames <- unique(combined_tracking$frame_id_seq)
+  logo_data <- data.frame(frame_id_seq = all_frames, x = xmax / 2, y = (ymin + ymax) / 2, image = team_logo)
+  
+  p <- ggplot() +
+    labs(
+      title = paste0("<span style='color:", offense_color, "'>**", posteam, 
+                     "**</span> **vs.** <span style='color:", defense_color, "'>**", 
+                     defteam, "**</span>"),
+      subtitle = stringr::str_wrap(play_info$desc[1], width = 80)
+    ) +
+    theme_void() +
+    theme(
+      plot.background = element_rect(fill = "#37743B", color = NA),
+      panel.background = element_rect(fill = "#37743B", color = NA),
+      plot.title = element_markdown(hjust = 0.5, size = 14, color = "white"),
+      plot.subtitle = element_text(hjust = 0.5, size = 8, color = "white")
+    ) +
+    annotate("segment", x = xmin, y = seq(max(10, ymin), min(ymax, 110), by = 5),
+             xend = xmax, yend = seq(max(10, ymin), min(ymax, 110), by = 5), 
+             color = "white", linewidth = 0.6, alpha = 0.5) +
+    geom_text(data = yard_line_labels, aes(x = 5, y = y, label = label),
+              color = "white", size = 4, fontface = "bold", alpha = 0.6) +
+    geom_text(data = yard_line_labels, aes(x = xmax - 5, y = y, label = label),
+              color = "white", size = 4, fontface = "bold", alpha = 0.6) +
+    geom_segment(data = hash_marks, aes(x = x, y = y, xend = xend, yend = yend),
+                 color = "white", linewidth = 0.4, alpha = 0.4) +
+    geom_image(data = logo_data, aes(x = x, y = y, image = image),
+               size = 0.12, asp = 1.6, alpha = 0.35) +
+    annotate("segment", x = xmin, y = los, xend = xmax, yend = los,
+             color = "#00BFFF", linewidth = 2.5, alpha = 0.9) +
+    annotate("segment", x = xmin, y = first_down_line, xend = xmax, yend = first_down_line,
+             color = "#FFD700", linewidth = 2.5, alpha = 0.9)
+  
+  if (nrow(ball_data) > 0) {
+    p <- p + geom_point(data = ball_data, aes(x = ball_land_y_std, y = ball_land_x_std),
+                        size = 8, shape = 21, fill = "#D2691E", color = "white", stroke = 3)
+  }
+  
+  p <- p +
+    geom_point(data = combined_tracking, aes(x = y_std, y = x_std, color = border_color, alpha = alpha),
+               size = 6, shape = 21, stroke = 2.5, fill = NA) +
+    geom_image(data = combined_tracking, aes(x = y_std, y = x_std, image = headshot, alpha = alpha),
+               size = 0.04, asp = 1.6) +
+    scale_color_identity() + scale_alpha_identity() +
+    coord_fixed(xlim = c(xmin, xmax), ylim = c(ymin, ymax)) +
+    transition_time(frame_id_seq) + ease_aes('linear')
+  
+  n_frames <- length(unique(combined_tracking$frame_id_seq))
+  
+  # EVEN SLOWER - fps = 3
+  anim <- animate(p, fps = 3, nframes = n_frames, width = 700, height = 400, renderer = gifski_renderer())
+  anim_save(gif_path, anim)
+  
+  return(TRUE)
+}
+
+# ============================================================================
+# GENERATE GIFS
+# ============================================================================
+
+cat("Step 15: Generating GIFs for 20 plays (this will take a while)...\n")
+
+gif_dir <- "play_gifs"
+if (!dir.exists(gif_dir)) dir.create(gif_dir)
+
+gif_paths <- list()
+for (i in 1:nrow(selected_plays)) {
+  game_id_sel <- as.numeric(selected_plays$game_id[i])
+  play_id_sel <- selected_plays$play_id[i]
+  gif_path <- file.path(gif_dir, paste0("play_", game_id_sel, "_", play_id_sel, ".gif"))
+  
+  cat("\n========== Play", i, "of", nrow(selected_plays), "==========\n")
+  
+  if (!file.exists(gif_path)) {
+    generate_play_gif(game_id_sel, play_id_sel, gif_path)
+  } else {
+    cat("GIF exists, skipping...\n")
+  }
+  
+  gif_paths[[paste(selected_plays$game_id[i], play_id_sel, sep = "_")]] <- gif_path
+}
+
+cat("\n\nAll GIFs generated! Launching app...\n")
+
+# ============================================================================
+# UI
+# ============================================================================
+
+ui <- dashboardPage(
+  skin = "green",
+  dashboardHeader(title = "Defender Anticipation Tracker"),
+  
+  dashboardSidebar(
+    width = 300,
+    selectInput("play_select", "Select Play:", choices = NULL, width = "100%"),
+    hr(),
+    h4("Play Info", style = "color: white; padding-left: 15px;"),
+    div(style = "padding: 10px; color: white; font-size: 12px;", textOutput("play_epa")),
+    hr(),
+    h4("Legend", style = "color: white; padding-left: 15px;"),
+    div(style = "padding: 10px; color: white; font-size: 11px;",
+        HTML("<span style='color: #00FF00;'>●</span> Broke on ball<br>"),
+        HTML("<span style='color: #FFD700;'>●</span> Defender (not broke)<br>"),
+        HTML("<span style='color: #FF0000;'>●</span> Never broke<br>"),
+        HTML("<span style='color: white;'>●</span> Offense<br>"),
+        HTML("<span style='color: #D2691E;'>●</span> Ball landing spot")
+    )
+  ),
+  
+  dashboardBody(
+    tags$head(tags$style(HTML("
+      .content-wrapper { background-color: #2c3e50; }
+      .box { background-color: #34495e; border-top: none; }
+      .box-header { color: white; }
+      .box-title { color: white; }
+    "))),
+    fluidRow(
+      box(title = "Play Animation", status = "success", solidHeader = TRUE, width = 8,
+          uiOutput("gif_display")),
+      box(title = "Season Percentiles", status = "warning", solidHeader = TRUE, width = 4,
+          gt_output("percentile_table"))
+    ),
+    fluidRow(
+      box(title = "All Defenders - Probability Changes", status = "info", solidHeader = TRUE, width = 12,
+          gt_output("summary_table"))
+    )
+  )
+)
+
+# ============================================================================
+# SERVER
+# ============================================================================
+
+server <- function(input, output, session) {
+  
+  observe({
+    choices_list <- setNames(
+      paste(selected_plays$game_id, selected_plays$play_id, sep = "_"),
+      paste0(selected_plays$epa_type, " | EPA: ", round(selected_plays$expected_points_added, 2))
+    )
+    updateSelectInput(session, "play_select", choices = choices_list)
+  })
+  
+  current_play <- reactive({
+    req(input$play_select)
+    parts <- strsplit(input$play_select, "_")[[1]]
+    list(
+      game_id = parts[1],
+      play_id = as.numeric(parts[2]),
+      gif_path = gif_paths[[input$play_select]],
+      summary = summary_stats_all %>% filter(game_id == parts[1], play_id == as.numeric(parts[2])),
+      epa = selected_plays %>% filter(game_id == parts[1], play_id == as.numeric(parts[2])) %>% pull(expected_points_added)
+    )
+  })
+  
+  output$gif_display <- renderUI({
+    req(current_play())
+    if (file.exists(current_play()$gif_path)) {
+      tags$img(src = dataURI(file = current_play()$gif_path, mime = "image/gif"),
+               style = "width: 100%; max-width: 700px;")
+    } else {
+      tags$p("GIF not found", style = "color: white;")
+    }
+  })
+  
+  output$play_epa <- renderText({
+    req(current_play())
+    paste("EPA:", round(current_play()$epa[1], 2))
+  })
+  
+  output$summary_table <- render_gt({
+    req(current_play())
+    
+    summary_stats <- current_play()$summary
+    if (nrow(summary_stats) == 0) return(data.frame(Message = "No data") %>% gt())
+    
+    breakers <- summary_stats %>% filter(broke_on_ball == 1) %>% arrange(desc(pd_end))
+    non_breakers <- summary_stats %>% filter(broke_on_ball == 0) %>% arrange(break_oe)
+    combined <- bind_rows(breakers, non_breakers)
+    
+    max_change <- max(abs(c(combined$pd_change, combined$tkl_change)), na.rm = TRUE)
+    max_change <- max(max_change, 10, na.rm = TRUE)
+    
+    combined %>%
+      mutate(broke_label = ifelse(broke_on_ball == 1, "✓", "✗")) %>%
+      select(headshot, player_name, player_position, broke_label,
+             break_oe_fmt, break_oe, frames_oe,
+             pd_start, pd_mid, pd_end, pd_change,
+             tkl_start, tkl_mid, tkl_end, tkl_change) %>%
+      gt() %>%
+      gt_img_rows(columns = headshot, height = 35, img_source = "web") %>%
+      cols_hide(columns = c(break_oe, pd_change, tkl_change)) %>%
+      cols_label(headshot = "", player_name = "Player", player_position = "Pos",
+                 broke_label = "Broke?",
+                 break_oe_fmt = "O/E", frames_oe = "O/E",
+                 pd_start = "Start", pd_mid = "Mid", pd_end = "End",
+                 tkl_start = "Start", tkl_mid = "Mid", tkl_end = "End") %>%
+      tab_spanner(label = "Break", columns = c(broke_label, break_oe_fmt)) %>%
+      tab_spanner(label = "Frames", columns = frames_oe) %>%
+      tab_spanner(label = "Pass Def Prob (%)", columns = c(pd_start, pd_mid, pd_end)) %>%
+      tab_spanner(label = "Tackle Prob (%)", columns = c(tkl_start, tkl_mid, tkl_end)) %>%
+      cols_align(align = "center", columns = everything()) %>%
+      cols_align(align = "left", columns = player_name) %>%
+      sub_missing(missing_text = "-") %>%
+      data_color(columns = c(pd_start, tkl_start),
+                 palette = c("#FADBD8", "#FFFFFF", "#D4EFDF", "#27AE60"), domain = c(0, 100), na_color = "#34495e") %>%
+      data_color(columns = pd_change, target_columns = c(pd_mid, pd_end),
+                 palette = c("#E74C3C", "#FADBD8", "#FFFFFF", "#D4EFDF", "#27AE60"),
+                 domain = c(-max_change, max_change), na_color = "#34495e") %>%
+      data_color(columns = tkl_change, target_columns = c(tkl_mid, tkl_end),
+                 palette = c("#E74C3C", "#FADBD8", "#FFFFFF", "#D4EFDF", "#27AE60"),
+                 domain = c(-max_change, max_change), na_color = "#34495e") %>%
+      data_color(columns = break_oe, target_columns = break_oe_fmt,
+                 palette = c("#FADBD8", "#FFFFFF", "#D4EFDF"), domain = c(-30, 30)) %>%
+      data_color(columns = frames_oe,
+                 palette = c("#D4EFDF", "#FFFFFF", "#FADBD8"), domain = c(-3, 3), na_color = "#34495e") %>%
+      tab_style(style = cell_text(weight = "bold"), locations = cells_column_labels()) %>%
+      tab_options(table.font.size = px(11), data_row.padding = px(4), table.background.color = "#34495e")
+  })
+  
+  output$percentile_table <- render_gt({
+    req(current_play())
+    
+    summary_stats <- current_play()$summary
+    if (nrow(summary_stats) == 0) return(data.frame(Message = "No data") %>% gt())
+    
+    breakers <- summary_stats %>% filter(broke_on_ball == 1) %>% arrange(desc(pd_end))
+    non_breakers <- summary_stats %>% filter(broke_on_ball == 0) %>% arrange(desc(break_oe_pctl))
+    combined <- bind_rows(breakers, non_breakers)
+    
+    combined %>%
+      select(headshot, player_name, player_position,
+             break_oe_pctl, frames_oe_pctl, pd_gain_pctl, tkl_gain_pctl) %>%
+      gt() %>%
+      gt_img_rows(columns = headshot, height = 30, img_source = "web") %>%
+      cols_label(headshot = "", player_name = "Player", player_position = "Pos",
+                 break_oe_pctl = "Break", frames_oe_pctl = "Speed",
+                 pd_gain_pctl = "PD Path", tkl_gain_pctl = "TKL Path") %>%
+      cols_align(align = "center", columns = everything()) %>%
+      cols_align(align = "left", columns = player_name) %>%
+      sub_missing(missing_text = "-") %>%
+      data_color(columns = c(break_oe_pctl, frames_oe_pctl, pd_gain_pctl, tkl_gain_pctl),
+                 palette = c("#E74C3C", "#F5B041", "#F7DC6F", "#82E0AA", "#27AE60"),
+                 domain = c(0, 100), na_color = "#34495e") %>%
+      tab_style(style = cell_text(weight = "bold", size = px(10)), locations = cells_column_labels()) %>%
+      tab_options(table.font.size = px(10), data_row.padding = px(2), table.background.color = "#34495e") %>%
+      tab_source_note(source_note = md("*Percentiles vs. players w/ 20+ plays*"))
+  })
+}
+
+# ============================================================================
+# RUN
+# ============================================================================
+
+shinyApp(ui = ui, server = server)
+
+library(dplyr)
+library(xgboost)
+library(nflreadr)
+
+cat("Step 1: Loading players...\n")
+players <- load_players()
+
+cat("Step 2: Type conversions...\n")
+model_data_full$game_id <- as.character(model_data_full$game_id)
+speed_model_full$game_id <- as.character(speed_model_full$game_id)
+sequential_model_data_final$game_id <- as.character(sequential_model_data_final$game_id)
+modeling_data$game_id <- as.character(modeling_data$game_id)
+
+cat("Step 3: Getting plays with breaks...\n")
+plays_with_breaks <- model_data_full %>%
+  filter(breaks_on_ball == 1) %>%
+  select(game_id, play_id) %>%
+  distinct()
+
+cat("Found", nrow(plays_with_breaks), "plays with breaks\n")
+
+cat("Step 4: Getting EPA...\n")
+plays_with_epa <- supp %>%
+  mutate(game_id = as.character(game_id)) %>%
+  inner_join(plays_with_breaks, by = c("game_id", "play_id")) %>%
+  filter(!is.na(expected_points_added)) %>%
+  select(game_id, play_id, expected_points_added) %>%
+  distinct()
+
+cat("Found", nrow(plays_with_epa), "plays with EPA\n")
+
+cat("Step 5: Selecting plays...\n")
+high_epa_plays <- plays_with_epa %>% arrange(desc(expected_points_added)) %>% head(1)
+low_epa_plays <- plays_with_epa %>% arrange(expected_points_added) %>% head(1)
+
+selected_plays <- bind_rows(
+  high_epa_plays %>% mutate(epa_type = "High EPA"),
+  low_epa_plays %>% mutate(epa_type = "Low EPA")
+)
+
+print(selected_plays)
+
+cat("Step 6: Getting break frames...\n")
+break_frames_all <- modeling_data %>%
+  inner_join(selected_plays %>% select(game_id, play_id), by = c("game_id", "play_id")) %>%
+  filter(!is.na(anticipation_frames)) %>%
+  select(game_id, play_id, nfl_id, anticipation_frame = anticipation_frames) %>%
+  distinct()
+
+cat("Found", nrow(break_frames_all), "break frames\n")
+
+cat("Step 7: Checking sequential_features exists...\n")
+print(sequential_features)
+
+cat("Step 8: Getting path data...\n")
+sequential_features_clean <- setdiff(sequential_features, "distance_to_qb_now")
+categorical_vars <- c("player_position", "coverage_responsibility", "alignment", 
+                      "dropback_type", "play_action")
+
+path_data_all <- sequential_model_data_final %>%
+  inner_join(selected_plays %>% select(game_id, play_id), by = c("game_id", "play_id")) %>%
+  inner_join(break_frames_all, by = c("game_id", "play_id", "nfl_id")) %>%
+  filter(frame_id >= anticipation_frame)
+
+cat("Path data rows:", nrow(path_data_all), "\n")
+
+# Save all the data the app needs
+save(
+  selected_plays,
+  summary_stats_all,
+  gif_paths,
+  file = "~/Desktop/bdb_app/app_data.RData"
+)
+
+# Copy the GIFs folder
+file.copy("play_gifs", "~/Desktop/bdb_app/", recursive = TRUE)
+
+library(rsconnect)
+rsconnect::deployApp(appDir = "~/Desktop/bdb_app")
